@@ -1,0 +1,128 @@
+# Synthetic data pipeline configuration
+# -------------------------------------
+# Keep all tunable values here so the generation pipeline stays reproducible.
+
+paths:
+  # Top-level data layout.
+  data_dir: data
+  cache_dir: data/cache
+  output_dir: data/synthetic
+  figures_dir: data/synthetic/figures
+
+  # Input data.
+  acled_csv: data/ACLED Data_2026-03-25.csv
+
+  # Downloaded/cacheable assets.
+  raw_graph_cache: data/cache/ukraine_major_roads.graphml
+  occupied_cache_gz: data/cache/deepstate-map-data.geojson.gz
+  occupied_cache_geojson: data/cache/deepstate-map-data.geojson
+  coastline_cache: data/cache/ukraine_coastline.geojson
+  boundary_cache: data/cache/ukraine_boundary.geojson
+
+  # Final reusable synthetic outputs.
+  filtered_raw_graph: data/synthetic/ukraine_filtered_raw.graphml
+  adaptive_graph: data/synthetic/ukraine_adaptive_coarse.graphml
+  demand_nodes_csv: data/synthetic/demand_nodes.csv
+  summary_json: data/synthetic/build_summary.json
+  bundle_pickle: data/synthetic/ukraine_synthetic_bundle.pkl
+  config_used_yaml: data/synthetic/config_used.yaml
+
+  # Optional saved figures.
+  occupied_filter_figure: data/synthetic/figures/current_occupied_filter.png
+  adaptive_figure: data/synthetic/figures/adaptive_coarsening.png
+  cost_figure: data/synthetic/figures/adaptive_cost_structure.png
+
+data_sources:
+  # Geographic source references.
+  ukraine_place: Ukraine
+  occupied_remote_url: https://raw.githubusercontent.com/cyterat/deepstate-map-data/main/deepstate-map-data.geojson.gz
+
+raw_graph:
+  # OSM road network download/filtering.
+  network_type: drive
+  custom_filter: '["highway"~"motorway|trunk|primary|secondary"]'
+  max_query_area_size: 50000000000
+
+occupied_filter:
+  # Occupied-area filtering.
+  # Keep only occupied nodes close to the inland Ukraine-facing occupied boundary.
+  frontline_keep_band_km: 20.0
+  # Match occupied-border segments to the Ukraine land border/coastline when identifying the Russia/sea side.
+  russia_side_match_km: 20.0
+  # Buffer used when removing coastline-adjacent segments from the full Ukraine boundary.
+  coastline_strip_km: 3.0
+  # Outside occupied areas, this controls how far the border-risk penalty reaches.
+  border_risk_buffer_km: 60.0
+
+demand:
+  # ACLED-based demand-node generation.
+  country: Ukraine
+  min_year: 2022
+  event_types:
+    - Explosions/Remote violence
+    - Battles
+    - Violence against civilians
+  n_clusters: 15
+  random_state: 42
+  candidate_cap: 200
+
+adaptive_coarsening:
+  # Demand-aware adaptive coarsening.
+  eps_near: 0.15
+  eps_mid: 0.25
+  eps_far: 0.40
+  near_radius: 0.50
+  mid_radius: 1.50
+
+costs:
+  # a_i / b_i cost construction.
+  scale_min: 1.0
+  scale_max: 10.0
+  large_hub_quantile: 0.75
+
+  # Occupation threat mixes direct nearness to occupied territory with node-level risk markers.
+  occupied_threat_weights:
+    occupied_proximity: 0.65
+    border_risk: 0.25
+    occupation_fraction: 0.10
+
+  # Exponential near-frontline pressure.
+  # Smaller decay_km means pressure stays high only very close to the occupied line.
+  # The final costs are multiplied by exp(exponent * pressure), so they are no longer capped at 10.
+  frontline_exponential:
+    decay_km: 10.0
+    threat_weight: 0.45
+    a_exponent: 2.2
+    b_exponent: 2.8
+
+  # Fixed opening cost.
+  a_i:
+    low_degree: 0.16
+    low_centrality: 0.12
+    small_cluster: 0.16
+    far_from_large_hub: 0.10
+    low_edge_support: 0.10
+    demand_penalty: 0.06
+    occupied_penalty: 0.42
+
+  # Per-unit capacity cost.
+  b_i:
+    low_centrality: 0.18
+    small_cluster: 0.16
+    far_from_large_hub: 0.12
+    low_edge_support: 0.18
+    demand_penalty: 0.04
+    occupied_penalty: 0.46
+
+visualization:
+  # Toggle figure generation and common styling.
+  enabled: true
+  use_basemap: true
+  basemap_zoom: 6
+  occupied_filter_figsize: [18, 8]
+  adaptive_figsize: [14, 9]
+  cost_figsize: [20, 8]
+  zone_colors:
+    near: "#d73027"
+    mid: "#fdae61"
+    far: "#1a9850"
