@@ -18,6 +18,8 @@ paths:
   occupied_cache_geojson: data/cache/deepstate-map-data.geojson
   coastline_cache: data/cache/ukraine_coastline.geojson
   boundary_cache: data/cache/ukraine_boundary.geojson
+  natural_earth_countries_zip: data/cache/ne_10m_admin_0_countries.zip
+  natural_earth_countries_dir: data/cache/ne_10m_admin_0_countries
 
   # Final reusable synthetic outputs.
   filtered_raw_graph: data/synthetic/ukraine_filtered_raw.graphml
@@ -30,12 +32,14 @@ paths:
   # Optional saved figures.
   occupied_filter_figure: data/synthetic/figures/current_occupied_filter.png
   adaptive_figure: data/synthetic/figures/adaptive_coarsening.png
-  cost_figure: data/synthetic/figures/adaptive_cost_structure.png
+  edge_metric_figure: data/synthetic/figures/adaptive_edge_metrics.png
+  cost_figure: data/synthetic/figures/adaptive_cost_score.png
 
 data_sources:
   # Geographic source references.
   ukraine_place: Ukraine
   occupied_remote_url: https://raw.githubusercontent.com/cyterat/deepstate-map-data/main/deepstate-map-data.geojson.gz
+  natural_earth_countries_url: https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_countries.zip
 
 raw_graph:
   # OSM road network download/filtering.
@@ -44,13 +48,12 @@ raw_graph:
   max_query_area_size: 50000000000
 
 occupied_filter:
-  # Occupied-area filtering.
-  # Keep only occupied nodes close to the inland Ukraine-facing occupied boundary.
-  frontline_keep_band_km: 20.0
-  # Match occupied-border segments to the Ukraine land border/coastline when identifying the Russia/sea side.
-  russia_side_match_km: 20.0
-  # Buffer used when removing coastline-adjacent segments from the full Ukraine boundary.
-  coastline_strip_km: 3.0
+  # Sovereign-held Ukraine geometry:
+  # Natural Earth land polygon minus the currently occupied territory.
+  # The raw graph is clipped to stay inside this new border, with a small tolerance.
+  outside_new_border_tolerance_km: 10.0
+  # Used to detect which parts of the new border are the occupied-frontline interface.
+  frontline_match_km: 10.0
   # Outside occupied areas, this controls how far the border-risk penalty reaches.
   border_risk_buffer_km: 60.0
 
@@ -75,44 +78,44 @@ adaptive_coarsening:
   mid_radius: 1.50
 
 costs:
-  # a_i / b_i cost construction.
-  scale_min: 1.0
-  scale_max: 10.0
-  large_hub_quantile: 0.75
+  # Cost score is built from only three interpretable inputs:
+  # 1. cluster size / inherited infrastructure
+  # 2. incident edge support / access support
+  # 3. distance to the occupied-facing frontline
 
-  # Occupation threat mixes direct nearness to occupied territory with node-level risk markers.
-  occupied_threat_weights:
-    occupied_proximity: 0.65
-    border_risk: 0.25
-    occupation_fraction: 0.10
+  # Final magnitudes:
+  # a_i = alpha * score
+  # b_i = beta  * score
+  alpha: 100.0
+  beta: 12.0
 
-  # Exponential near-frontline pressure.
-  # Smaller decay_km means pressure stays high only very close to the occupied line.
-  # The final costs are multiplied by exp(exponent * pressure), so they are no longer capped at 10.
-  frontline_exponential:
-    decay_km: 10.0
-    threat_weight: 0.45
-    a_exponent: 2.2
-    b_exponent: 2.8
+  # Importance factors in the weighted sum.
+  # All three components are on a 0-1 scale before weighting.
+  score_weights:
+    small_cluster: 0.10
+    low_edge_support: 0.30
+    frontline_danger: 0.60
 
-  # Fixed opening cost.
-  a_i:
-    low_degree: 0.16
-    low_centrality: 0.12
-    small_cluster: 0.16
-    far_from_large_hub: 0.10
-    low_edge_support: 0.10
-    demand_penalty: 0.06
-    occupied_penalty: 0.42
+  # Piecewise frontline-distance bands.
+  # 1. outside the new sovereign border -> flat very high penalty
+  # 2. near the frontline -> cubic penalty as distance approaches zero
+  # 3. somewhat further -> linear decline in penalty
+  # 4. far away -> logarithmically decaying tail
+  frontline_distance_bands_km:
+    near_km: 10.0
+    mid_km: 50.0
+    far_log_scale_km: 20.0
 
-  # Per-unit capacity cost.
-  b_i:
-    low_centrality: 0.18
-    small_cluster: 0.16
-    far_from_large_hub: 0.12
-    low_edge_support: 0.18
-    demand_penalty: 0.04
-    occupied_penalty: 0.46
+  # These values define the raw shape of the frontline penalty curve.
+  # The resulting raw frontline component is normalized to 0-1 before
+  # being combined with the other cost components.
+  frontline_component_values:
+    outside_border_flat: 20.0
+    near_ceiling: 18.0
+    near_floor: 10.0
+    mid_floor: 2.0
+    far_floor: 0.5
+
 
 visualization:
   # Toggle figure generation and common styling.

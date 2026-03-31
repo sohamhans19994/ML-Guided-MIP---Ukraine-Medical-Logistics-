@@ -52,7 +52,7 @@ def plot_occupied_filter(
     base_pos = {n: (data["x"], data["y"]) for n, data in base_sample.nodes(data=True)}
     filtered_pos = {n: (data["x"], data["y"]) for n, data in filtered_sample.nodes(data=True)}
 
-    removed_nodes = [n for n in filter_debug["removed_occupied_nodes"] if n in base_sample.nodes()]
+    removed_nodes = [n for n in filter_debug["removed_outside_new_border_nodes"] if n in base_sample.nodes()]
     kept_occupied_nodes = [
         n for n in filtered_sample.nodes() if filtered_sample.nodes[n].get("territory_occupation_fraction", 0.0) > 0.5
     ]
@@ -61,12 +61,12 @@ def plot_occupied_filter(
 
     fig, axes = plt.subplots(1, 2, figsize=figsize)
     panels = [
-        (axes[0], base_sample, base_pos, "Raw major-road graph with occupied-area overlay"),
+        (axes[0], base_sample, base_pos, "Raw major-road graph with sovereign-held Ukraine overlay"),
         (
             axes[1],
             filtered_sample,
             filtered_pos,
-            f"{config['occupied_filter']['frontline_keep_band_km']:.0f} km land-border-aware occupied-area filter",
+            f"Road graph clipped to sovereign-held Ukraine (+{config['occupied_filter']['outside_new_border_tolerance_km']:.0f} km tolerance)",
         ),
     ]
 
@@ -84,7 +84,7 @@ def plot_occupied_filter(
                 c="crimson",
                 alpha=0.65,
                 zorder=4,
-                label="Removed occupied nodes",
+                label="Removed outside new border",
             )
         if ax is axes[1] and kept_pos:
             ax.scatter(
@@ -94,7 +94,7 @@ def plot_occupied_filter(
                 c="orange",
                 alpha=0.55,
                 zorder=5,
-                label="Kept frontline-band nodes",
+                label="Kept occupied-adjacent nodes",
             )
 
         ax.set_title(title)
@@ -105,7 +105,7 @@ def plot_occupied_filter(
         if handles:
             ax.legend(loc="lower left")
 
-    plt.suptitle("Ukraine Raw Road Graph with Land-Border-Aware Occupied Filter", fontsize=14)
+    plt.suptitle("Ukraine Road Graph Clipped to the Sovereign-Held Border", fontsize=14)
     plt.tight_layout()
     ensure_parent(save_path)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -191,10 +191,107 @@ def plot_adaptive_graph(
     plt.close(fig)
 
 
-def plot_cost_maps(
+def plot_adaptive_edge_metrics(
     coarse_graph,
     demand_nodes,
-    node_params,
+    ukraine_shape,
+    occupied_gs,
+    save_path: str | Path,
+    config: dict,
+):
+    fig_cfg = config["visualization"]
+    zone_colors = fig_cfg["zone_colors"]
+    adaptive_pos = {n: (data["lon"], data["lat"]) for n, data in coarse_graph.nodes(data=True)}
+    minx, miny, maxx, maxy = ukraine_shape.total_bounds
+    x_pad = (maxx - minx) * 0.03
+    y_pad = (maxy - miny) * 0.03
+
+    fig, ax = plt.subplots(figsize=tuple(fig_cfg["adaptive_figsize"]))
+    ax.set_xlim(minx - x_pad, maxx + x_pad)
+    ax.set_ylim(miny - y_pad, maxy + y_pad)
+    _maybe_add_basemap(ax, bool(fig_cfg["use_basemap"]), int(fig_cfg["basemap_zoom"]))
+
+    ukraine_shape.boundary.plot(ax=ax, color="black", linewidth=1.0, alpha=0.8, zorder=1)
+    occupied_gs.boundary.plot(ax=ax, color="crimson", linewidth=1.1, alpha=0.85, zorder=2)
+
+    edge_list = list(coarse_graph.edges(data=True))
+    edge_path_counts = [data.get("abstracted_path_count", 1) for _, _, data in edge_list] or [1]
+    edge_widths = [
+        0.6 + 4.4 * np.sqrt(data.get("abstracted_path_count", 1)) / np.sqrt(max(edge_path_counts))
+        for _, _, data in edge_list
+    ]
+    edge_collection = nx.draw_networkx_edges(
+        coarse_graph,
+        adaptive_pos,
+        ax=ax,
+        edgelist=[(u, v) for u, v, _ in edge_list],
+        alpha=0.30,
+        edge_color="gray",
+        width=edge_widths,
+    )
+    edge_collection.set_zorder(3)
+
+    node_sizes = [20 + 4 * np.sqrt(coarse_graph.nodes[n]["member_count"]) for n in coarse_graph.nodes()]
+    node_colors = [zone_colors[coarse_graph.nodes[n]["zone"]] for n in coarse_graph.nodes()]
+    node_collection = nx.draw_networkx_nodes(
+        coarse_graph,
+        adaptive_pos,
+        ax=ax,
+        node_size=node_sizes,
+        node_color=node_colors,
+        alpha=0.85,
+        edgecolors="white",
+        linewidths=0.2,
+    )
+    node_collection.set_zorder(4)
+
+    demand_plot = demand_nodes.drop_duplicates(subset=["coarse_node"])
+    ax.scatter(
+        demand_plot["plot_lon"].to_list(),
+        demand_plot["plot_lat"].to_list(),
+        marker="*",
+        c="royalblue",
+        s=150,
+        zorder=5,
+        label="Demand node (snapped)",
+    )
+
+    edge_labels = {}
+    for u, v, data in edge_list:
+        travel_hr = data.get("travel_time", np.nan) / 3600.0 if np.isfinite(data.get("travel_time", np.nan)) else np.nan
+        road_km = data.get("length_m", np.nan) / 1000.0 if np.isfinite(data.get("length_m", np.nan)) else np.nan
+        travel_str = f"{travel_hr:.2f}h" if np.isfinite(travel_hr) else "NAh"
+        road_str = f"{road_km:.0f}km road" if np.isfinite(road_km) else "NA road"
+        edge_labels[(u, v)] = f"{travel_str}\n{road_str}"
+
+    nx.draw_networkx_edge_labels(
+        coarse_graph,
+        adaptive_pos,
+        edge_labels=edge_labels,
+        ax=ax,
+        font_size=6,
+        rotate=False,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.70, "pad": 0.15},
+    )
+
+    for zone in ["near", "mid", "far"]:
+        ax.scatter([], [], c=zone_colors[zone], s=80, label=f"{zone} zone")
+
+    ax.set_title("Adaptive Coarsening with Routed Road Distances and Times")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="lower left")
+    plt.tight_layout()
+    ensure_parent(save_path)
+    plt.savefig(save_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_cost_score(
+    coarse_graph,
+    demand_nodes,
+    cost_score,
     member_count,
     ukraine_shape,
     occupied_gs,
@@ -214,65 +311,59 @@ def plot_cost_maps(
         for _, _, data in edge_list
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=tuple(fig_cfg["cost_figsize"]))
-    for ax, cost_key, title in zip(
-        axes,
-        ["a_i", "b_i"],
-        ["a_i - Fixed Opening Cost", "b_i - Capacity Cost"],
-    ):
-        costs = [node_params[n][cost_key] for n in coarse_graph.nodes()]
-        norm = mcolors.Normalize(vmin=min(costs), vmax=max(costs))
-        cmap = cm.RdYlGn_r
+    costs = [cost_score[n] for n in coarse_graph.nodes()]
+    norm = mcolors.Normalize(vmin=min(costs), vmax=max(costs))
+    cmap = cm.RdYlGn_r
 
-        ax.set_xlim(minx - x_pad, maxx + x_pad)
-        ax.set_ylim(miny - y_pad, maxy + y_pad)
-        _maybe_add_basemap(ax, bool(fig_cfg["use_basemap"]), int(fig_cfg["basemap_zoom"]))
+    fig, ax = plt.subplots(1, 1, figsize=tuple(fig_cfg["cost_figsize"]))
+    ax.set_xlim(minx - x_pad, maxx + x_pad)
+    ax.set_ylim(miny - y_pad, maxy + y_pad)
+    _maybe_add_basemap(ax, bool(fig_cfg["use_basemap"]), int(fig_cfg["basemap_zoom"]))
 
-        ukraine_shape.boundary.plot(ax=ax, color="black", linewidth=1.0, alpha=0.8, zorder=1)
-        occupied_gs.boundary.plot(ax=ax, color="crimson", linewidth=1.2, alpha=0.9, zorder=2)
-        edge_collection = nx.draw_networkx_edges(
-            coarse_graph,
-            adaptive_pos,
-            ax=ax,
-            edgelist=[(u, v) for u, v, _ in edge_list],
-            edge_color="gray",
-            alpha=0.20,
-            width=edge_widths,
-        )
-        edge_collection.set_zorder(3)
+    ukraine_shape.boundary.plot(ax=ax, color="black", linewidth=1.0, alpha=0.8, zorder=1)
+    occupied_gs.boundary.plot(ax=ax, color="crimson", linewidth=1.2, alpha=0.9, zorder=2)
+    edge_collection = nx.draw_networkx_edges(
+        coarse_graph,
+        adaptive_pos,
+        ax=ax,
+        edgelist=[(u, v) for u, v, _ in edge_list],
+        edge_color="gray",
+        alpha=0.20,
+        width=edge_widths,
+    )
+    edge_collection.set_zorder(3)
 
-        node_collection = nx.draw_networkx_nodes(
-            coarse_graph,
-            adaptive_pos,
-            ax=ax,
-            node_color=costs,
-            cmap=cmap,
-            node_size=[30 + 5 * np.sqrt(member_count[n]) for n in coarse_graph.nodes()],
-            vmin=min(costs),
-            vmax=max(costs),
-        )
-        node_collection.set_zorder(4)
+    node_collection = nx.draw_networkx_nodes(
+        coarse_graph,
+        adaptive_pos,
+        ax=ax,
+        node_color=costs,
+        cmap=cmap,
+        node_size=[30 + 5 * np.sqrt(member_count[n]) for n in coarse_graph.nodes()],
+        vmin=min(costs),
+        vmax=max(costs),
+    )
+    node_collection.set_zorder(4)
 
-        ax.scatter(
-            demand_nodes["plot_lon"].to_list(),
-            demand_nodes["plot_lat"].to_list(),
-            marker="*",
-            c="blue",
-            s=150,
-            zorder=5,
-            label="Demand node (snapped)",
-        )
+    ax.scatter(
+        demand_nodes["plot_lon"].to_list(),
+        demand_nodes["plot_lat"].to_list(),
+        marker="*",
+        c="blue",
+        s=150,
+        zorder=5,
+        label="Demand node (snapped)",
+    )
 
-        plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label=cost_key)
-        ax.set_title(title)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        ax.set_aspect("equal", adjustable="box")
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(loc="lower left")
+    plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label="cost_score")
+    ax.set_title("Adaptive Graph Main Cost Score")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="box")
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc="lower left")
 
-    plt.suptitle("Adaptive Graph Node Costs - Demand Light, Occupation Heavy", fontsize=14)
     plt.tight_layout()
     ensure_parent(save_path)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")

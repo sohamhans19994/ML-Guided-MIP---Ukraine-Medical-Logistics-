@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import networkx as nx
 import numpy as np
 
 
@@ -21,158 +20,114 @@ def normalize(mapping):
     return output
 
 
-def _distance_to_large_hub(graph, node, hub_ids):
-    node_lat = graph.nodes[node]["lat"]
-    node_lon = graph.nodes[node]["lon"]
-    distances = []
-    for hub in hub_ids:
-        if hub == node:
-            continue
-        hub_lat = graph.nodes[hub]["lat"]
-        hub_lon = graph.nodes[hub]["lon"]
-        base_dist = ((node_lat - hub_lat) ** 2 + (node_lon - hub_lon) ** 2) ** 0.5
-        hub_scale = np.sqrt(graph.nodes[hub].get("member_count", 1))
-        distances.append(base_dist / hub_scale)
-    return min(distances) if distances else 0.0
+def compute_frontline_cost_component(
+    distance_km: float,
+    is_ukraine_side: bool,
+    band_cfg: dict,
+    value_cfg: dict,
+) -> float:
+    if not is_ukraine_side:
+        return float(value_cfg["outside_border_flat"])
+
+    near_km = float(band_cfg["near_km"])
+    mid_km = float(band_cfg["mid_km"])
+    far_scale_km = float(band_cfg["far_log_scale_km"])
+
+    near_floor = float(value_cfg["near_floor"])
+    near_ceiling = float(value_cfg["near_ceiling"])
+    mid_floor = float(value_cfg["mid_floor"])
+    far_floor = float(value_cfg["far_floor"])
+
+    distance_km = max(float(distance_km), 0.0)
+
+    if distance_km <= near_km:
+        t = distance_km / max(near_km, 1e-9)
+        return near_floor + (near_ceiling - near_floor) * ((1.0 - t) ** 3)
+
+    if distance_km <= mid_km:
+        t = (distance_km - near_km) / max(mid_km - near_km, 1e-9)
+        return mid_floor + (near_floor - mid_floor) * (1.0 - t)
+
+    return far_floor / (1.0 + np.log1p((distance_km - mid_km) / max(far_scale_km, 1e-9)))
 
 
 def compute_costs(coarse_graph, config: dict):
     cost_cfg = config["costs"]
-    degree = dict(coarse_graph.degree())
-    centrality = nx.betweenness_centrality(coarse_graph, weight="travel_time", normalized=True)
-
     member_count = {n: coarse_graph.nodes[n].get("member_count", 1) for n in coarse_graph.nodes()}
-    mean_demand_dist = {n: coarse_graph.nodes[n].get("mean_demand_dist", 0.0) for n in coarse_graph.nodes()}
-    territory_border_risk = {n: coarse_graph.nodes[n].get("territory_border_risk", 0.0) for n in coarse_graph.nodes()}
-    territory_occupation_fraction = {
-        n: coarse_graph.nodes[n].get("territory_occupation_fraction", 0.0) for n in coarse_graph.nodes()
-    }
-    territory_frontline_distance_km = {
-        n: coarse_graph.nodes[n].get("territory_frontline_distance_km", np.inf) for n in coarse_graph.nodes()
-    }
     incident_edge_support = {
         n: sum(data.get("abstracted_path_count", 1) for _, _, data in coarse_graph.edges(n, data=True))
         for n in coarse_graph.nodes()
     }
+    territory_frontline_distance_km = {
+        n: coarse_graph.nodes[n].get("territory_frontline_distance_km", np.inf) for n in coarse_graph.nodes()
+    }
+    territory_is_ukraine_side = {
+        n: bool(coarse_graph.nodes[n].get("territory_is_ukraine_side", True)) for n in coarse_graph.nodes()
+    }
 
-    large_hub_threshold = np.quantile(list(member_count.values()), float(cost_cfg["large_hub_quantile"]))
-    large_hub_ids = [n for n, count in member_count.items() if count >= large_hub_threshold]
-    if not large_hub_ids:
-        large_hub_ids = list(coarse_graph.nodes())
-
-    large_hub_dist = {n: _distance_to_large_hub(coarse_graph, n, large_hub_ids) for n in coarse_graph.nodes()}
-
-    norm_degree = normalize(degree)
-    norm_centrality = normalize(centrality)
     norm_member = normalize(member_count)
-    norm_large_hub_dist = normalize(large_hub_dist)
-    norm_incident_support = normalize(incident_edge_support)
-    norm_demand_dist = normalize(mean_demand_dist)
-    norm_occ_frontline_dist = normalize(territory_frontline_distance_km)
+    norm_support = normalize(incident_edge_support)
 
-    large_hub_proximity = {n: 1.0 - norm_large_hub_dist[n] for n in coarse_graph.nodes()}
-    demand_proximity = {n: 1.0 - norm_demand_dist[n] for n in coarse_graph.nodes()}
-    occupied_proximity = {n: 1.0 - norm_occ_frontline_dist[n] for n in coarse_graph.nodes()}
+    member_cost_component = {n: 1.0 - norm_member[n] for n in coarse_graph.nodes()}
+    edge_support_cost_component = {n: 1.0 - norm_support[n] for n in coarse_graph.nodes()}
 
-    threat_weights = cost_cfg["occupied_threat_weights"]
-    frontline_cfg = cost_cfg["frontline_exponential"]
-    decay_km = float(frontline_cfg["decay_km"])
-    frontline_exponential_pressure = {
-        n: (
-            float(np.exp(-max(float(territory_frontline_distance_km[n]), 0.0) / decay_km))
-            if np.isfinite(territory_frontline_distance_km[n])
-            else 0.0
+    raw_frontline_cost_component = {
+        n: compute_frontline_cost_component(
+            territory_frontline_distance_km[n],
+            territory_is_ukraine_side[n],
+            cost_cfg["frontline_distance_bands_km"],
+            cost_cfg["frontline_component_values"],
         )
         for n in coarse_graph.nodes()
     }
-    occupied_threat = {
+    frontline_cost_component = normalize(raw_frontline_cost_component)
+
+    weight_cfg = cost_cfg["score_weights"]
+    cost_score = {
         n: (
-            float(threat_weights["occupied_proximity"]) * occupied_proximity[n]
-            + float(threat_weights["border_risk"]) * territory_border_risk[n]
-            + float(threat_weights["occupation_fraction"]) * territory_occupation_fraction[n]
-            + float(frontline_cfg["threat_weight"]) * frontline_exponential_pressure[n]
+            float(weight_cfg["small_cluster"]) * member_cost_component[n]
+            + float(weight_cfg["low_edge_support"]) * edge_support_cost_component[n]
+            + float(weight_cfg["frontline_danger"]) * frontline_cost_component[n]
         )
         for n in coarse_graph.nodes()
     }
 
-    scale_min = float(cost_cfg["scale_min"])
-    scale_max = float(cost_cfg["scale_max"])
-    scale_span = scale_max - scale_min
+    alpha = float(cost_cfg["alpha"])
+    beta = float(cost_cfg["beta"])
 
-    a_weights = cost_cfg["a_i"]
-    b_weights = cost_cfg["b_i"]
-    node_params = {}
-    for node in coarse_graph.nodes():
-        base_a_score = (
-            float(a_weights["low_degree"]) * (1.0 - norm_degree[node])
-            + float(a_weights["low_centrality"]) * (1.0 - norm_centrality[node])
-            + float(a_weights["small_cluster"]) * (1.0 - norm_member[node])
-            + float(a_weights["far_from_large_hub"]) * (1.0 - large_hub_proximity[node])
-            + float(a_weights["low_edge_support"]) * (1.0 - norm_incident_support[node])
-            + float(a_weights["demand_penalty"]) * demand_proximity[node]
-            + float(a_weights["occupied_penalty"]) * occupied_threat[node]
-        )
-        base_b_score = (
-            float(b_weights["low_centrality"]) * (1.0 - norm_centrality[node])
-            + float(b_weights["small_cluster"]) * (1.0 - norm_member[node])
-            + float(b_weights["far_from_large_hub"]) * (1.0 - large_hub_proximity[node])
-            + float(b_weights["low_edge_support"]) * (1.0 - norm_incident_support[node])
-            + float(b_weights["demand_penalty"]) * demand_proximity[node]
-            + float(b_weights["occupied_penalty"]) * occupied_threat[node]
-        )
-        base_a_cost = scale_min + scale_span * base_a_score
-        base_b_cost = scale_min + scale_span * base_b_score
-
-        a_frontline_factor = float(
-            np.exp(float(frontline_cfg["a_exponent"]) * frontline_exponential_pressure[node])
-        )
-        b_frontline_factor = float(
-            np.exp(float(frontline_cfg["b_exponent"]) * frontline_exponential_pressure[node])
-        )
-        node_params[node] = {
-            "a_i": round(base_a_cost * a_frontline_factor, 3),
-            "b_i": round(base_b_cost * b_frontline_factor, 3),
+    node_params = {
+        n: {
+            "a_i": round(alpha * cost_score[n], 3),
+            "b_i": round(beta * cost_score[n], 3),
         }
+        for n in coarse_graph.nodes()
+    }
 
-    nx.set_node_attributes(coarse_graph, {n: values["a_i"] for n, values in node_params.items()}, "a_i")
-    nx.set_node_attributes(coarse_graph, {n: values["b_i"] for n, values in node_params.items()}, "b_i")
-    nx.set_node_attributes(coarse_graph, degree, "degree")
-    nx.set_node_attributes(coarse_graph, centrality, "betweenness_centrality")
+    nx_attrs_a = {n: values["a_i"] for n, values in node_params.items()}
+    nx_attrs_b = {n: values["b_i"] for n, values in node_params.items()}
+    import networkx as nx
+
+    nx.set_node_attributes(coarse_graph, nx_attrs_a, "a_i")
+    nx.set_node_attributes(coarse_graph, nx_attrs_b, "b_i")
     nx.set_node_attributes(coarse_graph, member_count, "member_count")
-    nx.set_node_attributes(coarse_graph, mean_demand_dist, "mean_demand_dist")
-    nx.set_node_attributes(coarse_graph, territory_frontline_distance_km, "territory_frontline_distance_km")
-    nx.set_node_attributes(coarse_graph, territory_border_risk, "territory_border_risk")
-    nx.set_node_attributes(coarse_graph, territory_occupation_fraction, "territory_occupation_fraction")
     nx.set_node_attributes(coarse_graph, incident_edge_support, "incident_edge_support")
-    nx.set_node_attributes(coarse_graph, occupied_threat, "occupied_threat")
-    nx.set_node_attributes(coarse_graph, frontline_exponential_pressure, "frontline_exponential_pressure")
-    nx.set_node_attributes(
-        coarse_graph,
-        {n: float(np.exp(float(frontline_cfg["a_exponent"]) * frontline_exponential_pressure[n])) for n in coarse_graph.nodes()},
-        "a_frontline_factor",
-    )
-    nx.set_node_attributes(
-        coarse_graph,
-        {n: float(np.exp(float(frontline_cfg["b_exponent"]) * frontline_exponential_pressure[n])) for n in coarse_graph.nodes()},
-        "b_frontline_factor",
-    )
+    nx.set_node_attributes(coarse_graph, territory_frontline_distance_km, "territory_frontline_distance_km")
+    nx.set_node_attributes(coarse_graph, territory_is_ukraine_side, "territory_is_ukraine_side")
+    nx.set_node_attributes(coarse_graph, member_cost_component, "member_cost_component")
+    nx.set_node_attributes(coarse_graph, edge_support_cost_component, "edge_support_cost_component")
+    nx.set_node_attributes(coarse_graph, raw_frontline_cost_component, "raw_frontline_cost_component")
+    nx.set_node_attributes(coarse_graph, frontline_cost_component, "frontline_cost_component")
+    nx.set_node_attributes(coarse_graph, cost_score, "cost_score")
 
     return {
         "node_params": node_params,
-        "degree": degree,
-        "centrality": centrality,
         "member_count": member_count,
-        "mean_demand_dist": mean_demand_dist,
-        "territory_border_risk": territory_border_risk,
-        "territory_occupation_fraction": territory_occupation_fraction,
-        "territory_frontline_distance_km": territory_frontline_distance_km,
         "incident_edge_support": incident_edge_support,
-        "large_hub_ids": large_hub_ids,
-        "large_hub_threshold": float(large_hub_threshold),
-        "large_hub_dist": large_hub_dist,
-        "large_hub_proximity": large_hub_proximity,
-        "demand_proximity": demand_proximity,
-        "occupied_proximity": occupied_proximity,
-        "occupied_threat": occupied_threat,
-        "frontline_exponential_pressure": frontline_exponential_pressure,
+        "territory_frontline_distance_km": territory_frontline_distance_km,
+        "territory_is_ukraine_side": territory_is_ukraine_side,
+        "member_cost_component": member_cost_component,
+        "edge_support_cost_component": edge_support_cost_component,
+        "raw_frontline_cost_component": raw_frontline_cost_component,
+        "frontline_cost_component": frontline_cost_component,
+        "cost_score": cost_score,
     }

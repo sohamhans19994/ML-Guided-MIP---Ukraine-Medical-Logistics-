@@ -11,9 +11,10 @@ from .config import load_config
 from .costs import compute_costs
 from .demand import load_demand_nodes, snap_demand_nodes_to_graph
 from .occupied import (
-    build_forgiving_current_filter,
+    annotate_graph_with_border_metrics,
+    clip_graph_to_sovereign_border,
     load_current_occupied_snapshot,
-    load_ukraine_boundary_and_land_border,
+    load_ukraine_sovereign_geometry,
 )
 from .raw_graph import load_raw_graph
 from .utils import (
@@ -25,7 +26,7 @@ from .utils import (
     write_pickle,
     write_yaml,
 )
-from .visualization import plot_adaptive_graph, plot_cost_maps, plot_occupied_filter
+from .visualization import plot_adaptive_edge_metrics, plot_adaptive_graph, plot_cost_score, plot_occupied_filter
 
 
 def build_synthetic_dataset(config_path: str | Path | None = None, generate_visuals: bool | None = None):
@@ -35,13 +36,21 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
     raw_graph = load_raw_graph(config)
 
     occupied = load_current_occupied_snapshot(config)
-    borders = load_ukraine_boundary_and_land_border(config)
-    filtered_graph, filter_debug = build_forgiving_current_filter(
+    borders = load_ukraine_sovereign_geometry(config, occupied["occupied_geom"])
+    clipped_graph, clip_debug = clip_graph_to_sovereign_border(
         raw_graph,
+        borders["sovereign_geom"],
         occupied["occupied_geom"],
-        occupied["occupied_components"],
-        borders["land_only_border_metric"],
-        borders["coastline_metric"],
+        config,
+    )
+    filtered_graph, filter_debug = annotate_graph_with_border_metrics(
+        clipped_graph,
+        borders["sovereign_geom"],
+        occupied["occupied_geom"],
+        borders["sovereign_border_metric"],
+        borders["frontline_boundary_metric"],
+        borders["exterior_boundary_metric"],
+        clip_debug,
         config,
     )
 
@@ -60,6 +69,16 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
     snapshot_date = occupied["snapshot_date"]
     snapshot_label = snapshot_date.strftime("%Y-%m-%d") if snapshot_date is not None else "undated"
     edge_path_counts = [data.get("abstracted_path_count", 1) for _, _, data in coarse_graph.edges(data=True)] or [1]
+    edge_lengths_km = [
+        float(data.get("length_m", float("nan"))) / 1000.0
+        for _, _, data in coarse_graph.edges(data=True)
+        if pd.notna(data.get("length_m", float("nan")))
+    ]
+    edge_times_hr = [
+        float(data.get("travel_time", float("nan"))) / 3600.0
+        for _, _, data in coarse_graph.edges(data=True)
+        if pd.notna(data.get("travel_time", float("nan")))
+    ]
 
     summary = {
         "snapshot_date": snapshot_label,
@@ -70,6 +89,7 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
         "filtered_graph": {
             "nodes": filtered_graph.number_of_nodes(),
             "edges": filtered_graph.number_of_edges(),
+            "removed_outside_new_border_nodes": len(filter_debug["removed_outside_new_border_nodes"]),
             "removed_occupied_nodes": len(filter_debug["removed_occupied_nodes"]),
             "removed_russia_side_nodes": len(filter_debug["removed_russia_side_nodes"]),
         },
@@ -86,6 +106,8 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
                 "mean": float(sum(edge_path_counts) / len(edge_path_counts)),
                 "max": max(edge_path_counts),
             },
+            "road_length_km": _finite_list_range(edge_lengths_km),
+            "travel_time_hr": _finite_list_range(edge_times_hr),
         },
         "demand_nodes": {
             "count": len(coarse_demand_nodes),
@@ -95,7 +117,7 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
         "costs": {
             "a_i": _cost_range(cost_details["node_params"], "a_i"),
             "b_i": _cost_range(cost_details["node_params"], "b_i"),
-            "large_hub_threshold": cost_details["large_hub_threshold"],
+            "cost_score": _mapping_range(cost_details["cost_score"]),
         },
     }
 
@@ -131,8 +153,8 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
             raw_graph=raw_graph,
             filtered_graph=filtered_graph,
             filter_debug=filter_debug,
-            ukraine_shape=borders["ukraine_shape"],
-            land_only_border_gs=borders["land_only_border_gs"],
+            ukraine_shape=borders["sovereign_shape"],
+            land_only_border_gs=borders["sovereign_border_gs"],
             occupied_gs=occupied["occupied_gs"],
             save_path=paths["occupied_filter_figure"],
             config=config,
@@ -140,17 +162,25 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
         plot_adaptive_graph(
             coarse_graph=coarse_graph,
             demand_nodes=coarse_demand_nodes,
-            ukraine_shape=borders["ukraine_shape"],
+            ukraine_shape=borders["sovereign_shape"],
             occupied_gs=occupied["occupied_gs"],
             save_path=paths["adaptive_figure"],
             config=config,
         )
-        plot_cost_maps(
+        plot_adaptive_edge_metrics(
+            coarse_graph=coarse_graph,
+            demand_nodes=coarse_demand_nodes,
+            ukraine_shape=borders["sovereign_shape"],
+            occupied_gs=occupied["occupied_gs"],
+            save_path=paths["edge_metric_figure"],
+            config=config,
+        )
+        plot_cost_score(
             coarse_graph=coarse_graph,
             demand_nodes=coarse_demand_nodes.drop_duplicates(subset=["coarse_node"]).copy(),
-            node_params=cost_details["node_params"],
+            cost_score=cost_details["cost_score"],
             member_count=cost_details["member_count"],
-            ukraine_shape=borders["ukraine_shape"],
+            ukraine_shape=borders["sovereign_shape"],
             occupied_gs=occupied["occupied_gs"],
             save_path=paths["cost_figure"],
             config=config,
@@ -171,4 +201,24 @@ def _cost_range(node_params: dict, key: str) -> dict:
         "min": min(values),
         "mean": float(sum(values) / len(values)),
         "max": max(values),
+    }
+
+
+def _mapping_range(mapping: dict) -> dict:
+    values = list(mapping.values())
+    return {
+        "min": min(values),
+        "mean": float(sum(values) / len(values)),
+        "max": max(values),
+    }
+
+
+def _finite_list_range(values: list[float]) -> dict:
+    finite_values = [float(value) for value in values if pd.notna(value)]
+    if not finite_values:
+        return {"min": float("nan"), "mean": float("nan"), "max": float("nan")}
+    return {
+        "min": min(finite_values),
+        "mean": float(sum(finite_values) / len(finite_values)),
+        "max": max(finite_values),
     }

@@ -32,6 +32,8 @@ def load_config(config_path: str | Path | None = None) -> dict:
         "occupied_cache_geojson",
         "coastline_cache",
         "boundary_cache",
+        "natural_earth_countries_zip",
+        "natural_earth_countries_dir",
         "filtered_raw_graph",
         "adaptive_graph",
         "demand_nodes_csv",
@@ -40,6 +42,7 @@ def load_config(config_path: str | Path | None = None) -> dict:
         "config_used_yaml",
         "occupied_filter_figure",
         "adaptive_figure",
+        "edge_metric_figure",
         "cost_figure",
     ]:
         if key in paths:

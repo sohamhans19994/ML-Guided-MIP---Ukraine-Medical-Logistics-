@@ -76,6 +76,20 @@ def main():
         f"mean={sum(edge_path_counts) / len(edge_path_counts):.2f}, "
         f"max={max(edge_path_counts)}"
     )
+    if "road_length_km" in summary["adaptive_graph"]:
+        print(
+            "Coarse-edge road length (km): "
+            f"min={summary['adaptive_graph']['road_length_km']['min']:.2f}, "
+            f"mean={summary['adaptive_graph']['road_length_km']['mean']:.2f}, "
+            f"max={summary['adaptive_graph']['road_length_km']['max']:.2f}"
+        )
+    if "travel_time_hr" in summary["adaptive_graph"]:
+        print(
+            "Coarse-edge travel time (hr): "
+            f"min={summary['adaptive_graph']['travel_time_hr']['min']:.2f}, "
+            f"mean={summary['adaptive_graph']['travel_time_hr']['mean']:.2f}, "
+            f"max={summary['adaptive_graph']['travel_time_hr']['max']:.2f}"
+        )
     print(
         "Demand nodes: "
         f"{summary['demand_nodes']['count']} rows, "
@@ -89,12 +103,18 @@ def main():
         f"b_i range: {summary['costs']['b_i']['min']:.2f} to {summary['costs']['b_i']['max']:.2f}, "
         f"mean={summary['costs']['b_i']['mean']:.2f}"
     )
+    print(
+        f"cost_score range: {summary['costs']['cost_score']['min']:.2f} to {summary['costs']['cost_score']['max']:.2f}, "
+        f"mean={summary['costs']['cost_score']['mean']:.2f}"
+    )
 
     print("\nTop coarse edges by abstracted path count:")
     for u, v, data in top_edges:
         print(
             f"  ({u}, {v}) paths={data.get('abstracted_path_count', 1)}, "
-            f"travel_time_hr={data.get('travel_time', 0.0) / 3600.0:.2f}"
+            f"travel_time_hr={data.get('travel_time', 0.0) / 3600.0:.2f}, "
+            f"road_km={data.get('length_m', float('nan')) / 1000.0:.1f}, "
+            f"source={data.get('metric_source', 'unknown')}"
         )
 
     print("\nTop 5 cheapest coarse nodes by a_i:")
@@ -103,8 +123,11 @@ def main():
         print(
             f"  node={node} a_i={attrs.get('a_i'):.3f} b_i={attrs.get('b_i'):.3f} "
             f"members={attrs.get('member_count')} zone={attrs.get('zone')} "
-            f"occupied_threat={attrs.get('occupied_threat', 0.0):.3f} "
-            f"edge_support={attrs.get('incident_edge_support', 0)}"
+            f"frontline_km={attrs.get('territory_frontline_distance_km', float('nan')):.2f} "
+            f"member_component={attrs.get('member_cost_component', 0.0):.3f} "
+            f"support_component={attrs.get('edge_support_cost_component', 0.0):.3f} "
+            f"raw_frontline={attrs.get('raw_frontline_cost_component', 0.0):.3f} "
+            f"frontline_component={attrs.get('frontline_cost_component', 0.0):.3f}"
         )
 
     print("\nSaved outputs:")
@@ -116,6 +139,7 @@ def main():
     if not args.no_visuals:
         print(f"  occupied filter figure: {config['paths']['occupied_filter_figure']}")
         print(f"  adaptive figure: {config['paths']['adaptive_figure']}")
+        print(f"  edge metric figure: {config['paths']['edge_metric_figure']}")
         print(f"  cost figure: {config['paths']['cost_figure']}")
 
 

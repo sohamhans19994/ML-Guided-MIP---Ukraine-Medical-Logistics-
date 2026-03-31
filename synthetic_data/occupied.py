@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import gzip
 import shutil
+import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
 import geopandas as gpd
 import networkx as nx
 import numpy as np
-import osmnx as ox
 import pandas as pd
 
 from .utils import migrate_if_missing
@@ -37,14 +37,8 @@ def load_current_occupied_snapshot(config: dict):
     cache_gz = Path(paths["occupied_cache_gz"])
     cache_geojson = Path(paths["occupied_cache_geojson"])
 
-    migrate_if_missing(
-        cache_geojson,
-        [config["_project_root"] / "data" / "deepstate-map-data.geojson"],
-    )
-    migrate_if_missing(
-        cache_gz,
-        [config["_project_root"] / "data" / "deepstate-map-data.geojson.gz"],
-    )
+    migrate_if_missing(cache_geojson, [config["_project_root"] / "data" / "deepstate-map-data.geojson"])
+    migrate_if_missing(cache_gz, [config["_project_root"] / "data" / "deepstate-map-data.geojson.gz"])
 
     cache_gz.parent.mkdir(parents=True, exist_ok=True)
 
@@ -89,78 +83,135 @@ def load_current_occupied_snapshot(config: dict):
     }
 
 
-def load_ukraine_boundary_and_land_border(config: dict):
+def _ensure_zip_downloaded(url: str, zip_path: Path) -> None:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    if not zip_path.exists():
+        with urlopen(url) as response, zip_path.open("wb") as out_file:
+            shutil.copyfileobj(response, out_file)
+
+
+def _ensure_zip_extracted(zip_path: Path, extract_dir: Path) -> Path:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    shp_files = sorted(extract_dir.glob("*.shp"))
+    if shp_files:
+        return shp_files[0]
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(extract_dir)
+
+    shp_files = sorted(extract_dir.glob("*.shp"))
+    if not shp_files:
+        raise FileNotFoundError(f"No shapefile found after extracting {zip_path}")
+    return shp_files[0]
+
+
+def load_ukraine_sovereign_geometry(config: dict, occupied_geom):
     paths = config["paths"]
     occ_cfg = config["occupied_filter"]
-    boundary_cache = Path(paths["boundary_cache"])
-    coastline_cache = Path(paths["coastline_cache"])
+    countries_zip = Path(paths["natural_earth_countries_zip"])
+    countries_dir = Path(paths["natural_earth_countries_dir"])
+    countries_url = config["data_sources"]["natural_earth_countries_url"]
 
-    migrate_if_missing(
-        coastline_cache,
-        [config["_project_root"] / "cache" / "ukraine_coastline.geojson"],
-    )
+    _ensure_zip_downloaded(countries_url, countries_zip)
+    countries_shp = _ensure_zip_extracted(countries_zip, countries_dir)
 
-    boundary_cache.parent.mkdir(parents=True, exist_ok=True)
-    coastline_cache.parent.mkdir(parents=True, exist_ok=True)
-
-    if boundary_cache.exists():
-        ukraine_shape = gpd.read_file(boundary_cache).to_crs("EPSG:4326")
-    else:
-        ukraine_shape = ox.geocode_to_gdf(config["data_sources"]["ukraine_place"])
-        ukraine_shape.to_file(boundary_cache, driver="GeoJSON")
+    ne_countries = gpd.read_file(countries_shp).to_crs("EPSG:4326")
+    ukraine_shape = ne_countries[
+        (ne_countries.get("ADMIN") == "Ukraine")
+        | (ne_countries.get("SOVEREIGNT") == "Ukraine")
+        | (ne_countries.get("NAME") == "Ukraine")
+    ].copy()
+    if ukraine_shape.empty:
+        raise ValueError("Could not find Ukraine in the Natural Earth country polygon layer")
 
     ukraine_geom = (
         ukraine_shape.geometry.union_all()
         if hasattr(ukraine_shape.geometry, "union_all")
         else ukraine_shape.geometry.unary_union
     )
+    occupied_metric = gpd.GeoSeries([occupied_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
     ukraine_metric = gpd.GeoSeries([ukraine_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
-    full_boundary_metric = ukraine_metric.boundary
 
-    if coastline_cache.exists():
-        coastline_gdf = gpd.read_file(coastline_cache)
-    else:
-        coastline_gdf = ox.features_from_place(
-            config["data_sources"]["ukraine_place"],
-            tags={"natural": "coastline"},
-        ).copy()
-        coastline_gdf = coastline_gdf[
-            coastline_gdf.geometry.geom_type.isin(["LineString", "MultiLineString"])
-        ].copy()
-        coastline_gdf.to_file(coastline_cache, driver="GeoJSON")
+    sovereign_metric = ukraine_metric.difference(occupied_metric)
+    if sovereign_metric.is_empty:
+        raise ValueError("Ukraine sovereign-held geometry became empty after removing occupied territory")
 
-    coastline_gdf = coastline_gdf.to_crs("EPSG:4326")
-    coastline_metric = coastline_gdf.to_crs(3857)
-    coastline_union_metric = (
-        coastline_metric.geometry.union_all()
-        if hasattr(coastline_metric.geometry, "union_all")
-        else coastline_metric.geometry.unary_union
+    sovereign_geom = gpd.GeoSeries([sovereign_metric], crs=3857).to_crs("EPSG:4326").iloc[0]
+    sovereign_shape = gpd.GeoDataFrame(geometry=[sovereign_geom], crs="EPSG:4326")
+    sovereign_border_metric = sovereign_metric.boundary
+
+    frontline_match_km = float(occ_cfg["frontline_match_km"])
+    frontline_boundary_metric = sovereign_border_metric.intersection(
+        occupied_metric.buffer(frontline_match_km * 1000.0)
     )
+    if frontline_boundary_metric.is_empty:
+        frontline_boundary_metric = occupied_metric.boundary
 
-    land_only_border_metric = full_boundary_metric.difference(
-        coastline_union_metric.buffer(float(occ_cfg["coastline_strip_km"]) * 1000.0)
+    exterior_boundary_metric = sovereign_border_metric.difference(
+        occupied_metric.buffer(frontline_match_km * 1000.0)
     )
+    if exterior_boundary_metric.is_empty:
+        exterior_boundary_metric = sovereign_border_metric
 
     return {
         "ukraine_shape": ukraine_shape,
         "ukraine_geom": ukraine_geom,
-        "land_only_border_metric": land_only_border_metric,
-        "coastline_metric": coastline_union_metric,
-        "land_only_border_gs": gpd.GeoSeries([land_only_border_metric], crs=3857).to_crs("EPSG:4326"),
+        "sovereign_shape": sovereign_shape,
+        "sovereign_geom": sovereign_geom,
+        "sovereign_border_metric": sovereign_border_metric,
+        "sovereign_border_gs": gpd.GeoSeries([sovereign_border_metric], crs=3857).to_crs("EPSG:4326"),
+        "frontline_boundary_metric": frontline_boundary_metric,
+        "frontline_boundary_gs": gpd.GeoSeries([frontline_boundary_metric], crs=3857).to_crs("EPSG:4326"),
+        "exterior_boundary_metric": exterior_boundary_metric,
     }
 
 
-def build_forgiving_current_filter(
+def clip_graph_to_sovereign_border(graph, sovereign_geom, occupied_geom, config: dict):
+    tolerance_km = float(config["occupied_filter"]["outside_new_border_tolerance_km"])
+    tolerance_m = tolerance_km * 1000.0
+
+    node_ids = list(graph.nodes())
+    node_points = gpd.GeoSeries(
+        gpd.points_from_xy([graph.nodes[n]["x"] for n in node_ids], [graph.nodes[n]["y"] for n in node_ids]),
+        index=node_ids,
+        crs="EPSG:4326",
+    )
+    node_points_metric = node_points.to_crs(3857)
+    sovereign_metric = gpd.GeoSeries([sovereign_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
+    sovereign_buffer_metric = sovereign_metric.buffer(tolerance_m)
+
+    inside_sovereign = node_points.intersects(sovereign_geom).to_dict()
+    inside_occupied_raw = node_points.intersects(occupied_geom).to_dict()
+    within_tolerance = {
+        n: bool(node_points_metric.loc[n].intersects(sovereign_buffer_metric)) for n in node_ids
+    }
+    removed_outside_nodes = [n for n in node_ids if not within_tolerance[n]]
+
+    clipped_graph = graph.copy()
+    clipped_graph.remove_nodes_from(removed_outside_nodes)
+    isolated_nodes = [n for n, deg in dict(clipped_graph.degree()).items() if deg == 0]
+    clipped_graph.remove_nodes_from(isolated_nodes)
+
+    return clipped_graph, {
+        "inside_sovereign": inside_sovereign,
+        "inside_occupied_raw": inside_occupied_raw,
+        "within_tolerance": within_tolerance,
+        "removed_outside_new_border_nodes": removed_outside_nodes,
+        "outside_new_border_tolerance_km": tolerance_km,
+    }
+
+
+def annotate_graph_with_border_metrics(
     graph,
+    sovereign_geom,
     occupied_geom,
-    occupied_components,
-    land_only_border_metric,
-    coastline_metric,
+    sovereign_border_metric,
+    frontline_boundary_metric,
+    exterior_boundary_metric,
+    clip_debug: dict,
     config: dict,
 ):
     occ_cfg = config["occupied_filter"]
-    keep_band_km = float(occ_cfg["frontline_keep_band_km"])
-    russia_side_match_km = float(occ_cfg["russia_side_match_km"])
     border_risk_buffer_km = float(occ_cfg["border_risk_buffer_km"])
 
     node_ids = list(graph.nodes())
@@ -170,159 +221,71 @@ def build_forgiving_current_filter(
         crs="EPSG:4326",
     )
     node_points_metric = node_points.to_crs(3857)
-    inside_occupied = node_points.intersects(occupied_geom).to_dict()
 
-    russia_side_reference_metric = land_only_border_metric.union(coastline_metric)
-    russia_side_buffer_metric = russia_side_reference_metric.buffer(russia_side_match_km * 1000.0)
+    inside_sovereign = {n: bool(node_points.loc[n].intersects(sovereign_geom)) for n in node_ids}
+    inside_occupied = {n: bool(node_points.loc[n].intersects(occupied_geom)) for n in node_ids}
 
-    territory_frontline_distance_km = {n: np.inf for n in node_ids}
-    territory_rear_distance_km = {n: np.inf for n in node_ids}
-    territory_interior_depth_km = {n: 0.0 for n in node_ids}
-    territory_cross_width_km = {n: np.inf for n in node_ids}
-    territory_removal_threshold_km = {n: keep_band_km for n in node_ids}
-    territory_is_ukraine_side = {n: False for n in node_ids}
-    frontline_boundaries_metric = []
-
-    for poly in occupied_components:
-        poly_nodes = [n for n in node_ids if inside_occupied[n] and node_points.loc[n].intersects(poly)]
-        if not poly_nodes:
-            continue
-
-        poly_metric = gpd.GeoSeries([poly], crs="EPSG:4326").to_crs(3857).iloc[0]
-        poly_boundary = poly_metric.boundary
-        rear_boundary = poly_boundary.intersection(russia_side_buffer_metric)
-        frontline_boundary = poly_boundary.difference(russia_side_buffer_metric)
-
-        if rear_boundary.is_empty:
-            rear_boundary = poly_boundary
-        if not frontline_boundary.is_empty:
-            frontline_boundaries_metric.append(frontline_boundary)
-
-        if frontline_boundary.is_empty:
-            poly_front_dists = {n: float("inf") for n in poly_nodes}
-        else:
-            poly_front_dists = {
-                n: float(node_points_metric.loc[n].distance(frontline_boundary) / 1000.0)
-                for n in poly_nodes
-            }
-        poly_rear_dists = {
-            n: float(node_points_metric.loc[n].distance(rear_boundary) / 1000.0)
-            for n in poly_nodes
-        }
-
-        finite_cross_widths = [
-            poly_front_dists[n] + poly_rear_dists[n]
-            for n in poly_nodes
-            if np.isfinite(poly_front_dists[n]) and np.isfinite(poly_rear_dists[n])
-        ]
-        component_cross_width_km = max(finite_cross_widths) if finite_cross_widths else np.inf
-
-        for n in poly_nodes:
-            territory_frontline_distance_km[n] = poly_front_dists[n]
-            territory_rear_distance_km[n] = poly_rear_dists[n]
-            territory_interior_depth_km[n] = poly_front_dists[n]
-            territory_cross_width_km[n] = component_cross_width_km
-            territory_is_ukraine_side[n] = np.isfinite(poly_front_dists[n]) and (
-                poly_front_dists[n] <= poly_rear_dists[n]
-            )
-
-    if frontline_boundaries_metric:
-        frontline_series = gpd.GeoSeries(frontline_boundaries_metric, crs=3857)
-        frontline_boundary_metric = (
-            frontline_series.union_all() if hasattr(frontline_series, "union_all") else frontline_series.unary_union
-        )
-    else:
-        frontline_boundary_metric = gpd.GeoSeries([occupied_geom], crs="EPSG:4326").to_crs(3857).boundary.iloc[0]
-
-    border_distance_km = {}
-    for n in node_ids:
-        if inside_occupied[n]:
-            border_distance_km[n] = territory_frontline_distance_km[n]
-        else:
-            border_distance_km[n] = float(node_points_metric.loc[n].distance(frontline_boundary_metric) / 1000.0)
-
-    removed_occupied_nodes = [
-        n
+    border_distance_km = {
+        n: float(node_points_metric.loc[n].distance(sovereign_border_metric) / 1000.0)
         for n in node_ids
-        if inside_occupied[n]
-        and (
-            not territory_is_ukraine_side[n]
-            or not np.isfinite(territory_frontline_distance_km[n])
-            or territory_frontline_distance_km[n] > keep_band_km
-        )
-    ]
-    removed_russia_side_nodes = [n for n in node_ids if inside_occupied[n] and (not territory_is_ukraine_side[n])]
+    }
+    territory_frontline_distance_km = {
+        n: float(node_points_metric.loc[n].distance(frontline_boundary_metric) / 1000.0)
+        for n in node_ids
+    }
+    territory_rear_distance_km = {
+        n: float(node_points_metric.loc[n].distance(exterior_boundary_metric) / 1000.0)
+        for n in node_ids
+    }
+    territory_interior_depth_km = {
+        n: territory_frontline_distance_km[n] if inside_occupied[n] else 0.0
+        for n in node_ids
+    }
+    territory_cross_width_km = {
+        n: territory_frontline_distance_km[n] + territory_rear_distance_km[n]
+        for n in node_ids
+    }
+    territory_removal_threshold_km = {
+        n: float(occ_cfg["outside_new_border_tolerance_km"]) for n in node_ids
+    }
+    territory_is_ukraine_side = {
+        n: bool(inside_sovereign[n]) for n in node_ids
+    }
 
+    frontline_proximity = {
+        n: max(0.0, 1.0 - min(territory_frontline_distance_km[n], border_risk_buffer_km) / border_risk_buffer_km)
+        for n in node_ids
+    }
     border_proximity = {
         n: max(0.0, 1.0 - min(border_distance_km[n], border_risk_buffer_km) / border_risk_buffer_km)
         for n in node_ids
     }
+
     territory_border_risk = {}
     for n in node_ids:
         if inside_occupied[n]:
-            if territory_is_ukraine_side[n] and np.isfinite(territory_frontline_distance_km[n]):
-                inside_pressure = min(1.0, territory_frontline_distance_km[n] / keep_band_km)
-                territory_border_risk[n] = min(1.0, 0.55 + 0.45 * inside_pressure)
-            else:
-                territory_border_risk[n] = 1.0
+            territory_border_risk[n] = min(1.0, 0.75 + 0.25 * frontline_proximity[n])
+        elif inside_sovereign[n]:
+            territory_border_risk[n] = max(0.85 * frontline_proximity[n], 0.20 * border_proximity[n])
         else:
-            territory_border_risk[n] = 0.85 * border_proximity[n]
+            territory_border_risk[n] = min(1.0, 0.60 + 0.40 * frontline_proximity[n])
 
-    filtered_graph = graph.copy()
-    filtered_graph.remove_nodes_from(removed_occupied_nodes)
-    isolated_nodes = [n for n, deg in dict(filtered_graph.degree()).items() if deg == 0]
-    filtered_graph.remove_nodes_from(isolated_nodes)
+    nx.set_node_attributes(graph, {n: float(inside_occupied[n]) for n in node_ids}, "territory_occupation_fraction")
+    nx.set_node_attributes(graph, border_distance_km, "territory_border_distance_km")
+    nx.set_node_attributes(graph, territory_interior_depth_km, "territory_interior_depth_km")
+    nx.set_node_attributes(graph, territory_cross_width_km, "territory_cross_width_km")
+    nx.set_node_attributes(graph, territory_removal_threshold_km, "territory_removal_threshold_km")
+    nx.set_node_attributes(graph, territory_frontline_distance_km, "territory_frontline_distance_km")
+    nx.set_node_attributes(graph, territory_rear_distance_km, "territory_rear_distance_km")
+    nx.set_node_attributes(graph, territory_is_ukraine_side, "territory_is_ukraine_side")
+    nx.set_node_attributes(graph, territory_border_risk, "territory_border_risk")
 
-    surviving_nodes = list(filtered_graph.nodes())
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(inside_occupied[n]) for n in surviving_nodes},
-        "territory_occupation_fraction",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(border_distance_km[n]) for n in surviving_nodes},
-        "territory_border_distance_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_interior_depth_km[n]) for n in surviving_nodes},
-        "territory_interior_depth_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_cross_width_km[n]) for n in surviving_nodes},
-        "territory_cross_width_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_removal_threshold_km[n]) for n in surviving_nodes},
-        "territory_removal_threshold_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_frontline_distance_km[n]) for n in surviving_nodes},
-        "territory_frontline_distance_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_rear_distance_km[n]) for n in surviving_nodes},
-        "territory_rear_distance_km",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: bool(territory_is_ukraine_side[n]) for n in surviving_nodes},
-        "territory_is_ukraine_side",
-    )
-    nx.set_node_attributes(
-        filtered_graph,
-        {n: float(territory_border_risk[n]) for n in surviving_nodes},
-        "territory_border_risk",
-    )
+    removed_outside_nodes = clip_debug["removed_outside_new_border_nodes"]
+    removed_occupied_nodes = [n for n in removed_outside_nodes if clip_debug["inside_occupied_raw"].get(n, False)]
 
-    return filtered_graph, {
+    return graph, {
+        "inside_sovereign": inside_sovereign,
         "inside_occupied": inside_occupied,
-        "occupied_geom": occupied_geom,
         "border_distance_km": border_distance_km,
         "territory_frontline_distance_km": territory_frontline_distance_km,
         "territory_rear_distance_km": territory_rear_distance_km,
@@ -332,5 +295,6 @@ def build_forgiving_current_filter(
         "territory_border_risk": territory_border_risk,
         "territory_is_ukraine_side": territory_is_ukraine_side,
         "removed_occupied_nodes": removed_occupied_nodes,
-        "removed_russia_side_nodes": removed_russia_side_nodes,
+        "removed_russia_side_nodes": removed_occupied_nodes,
+        "removed_outside_new_border_nodes": removed_outside_nodes,
     }
