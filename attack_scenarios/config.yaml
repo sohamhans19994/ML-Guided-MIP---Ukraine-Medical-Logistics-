@@ -1,0 +1,50 @@
+paths:
+  bundle_path: data/synthetic/ukraine_synthetic_bundle.pkl
+  output_root: data/attack_scenarios
+  save_outputs: true
+
+scenario:
+  attack_mode: combo
+  base_budget: 2.0
+  scenario_id:
+  remove_isolated_nodes: true
+
+attack_model:
+  depth_penalty_gamma: 2.0
+  defense_alpha: 0.7
+  defense_beta: 0.3
+  minimum_defense_score: 0.05
+  theta_degrade: 0.5
+  theta_remove: 1.5
+  degrade_multiplier: 3.0
+  bomb_reduction_factor: 5.0
+
+candidate_generation:
+  candidate_grid_spacing_km: 30.0
+  edge_midpoint_candidate_count: 80
+
+budget:
+  location_cost: 1.0
+  missile_cost: 1.0
+  bomb_cost: 0.5
+  location_link_radius_km: 100.0
+  max_locations: 6
+  min_location_separation_km: 60.0
+  random_seed: 42
+
+attacks:
+  missile:
+    enabled: true
+    radius_km: 12.0
+    max_strikes: 6
+    min_strike_separation_km: 20.0
+    manual_strike_centers: []
+  bomb:
+    enabled: true
+    radius_km: 30.0
+    max_strikes: 8
+    min_strike_separation_km: 30.0
+    manual_strike_centers: []
+
+visualization:
+  enabled: true

@@ -61,6 +61,8 @@ demand:
   # ACLED-based demand-node generation.
   country: Ukraine
   min_year: 2022
+  # Convert cumulative ACLED demand into a daily-average demand level.
+  averaging_days: 730
   event_types:
     - Explosions/Remote violence
     - Battles
@@ -87,7 +89,7 @@ costs:
   # a_i = alpha * score
   # b_i = beta  * score
   alpha: 100.0
-  beta: 12.0
+  beta: 2.5
 
   # Importance factors in the weighted sum.
   # All three components are on a 0-1 scale before weighting.
@@ -110,11 +112,11 @@ costs:
   # The resulting raw frontline component is normalized to 0-1 before
   # being combined with the other cost components.
   frontline_component_values:
-    outside_border_flat: 20.0
-    near_ceiling: 18.0
-    near_floor: 10.0
-    mid_floor: 2.0
-    far_floor: 0.5
+    outside_border_flat: 150.0
+    near_ceiling: 150.0
+    near_floor: 125.0
+    mid_floor: 110.0
+    far_floor: 100.5
 
 
 visualization:

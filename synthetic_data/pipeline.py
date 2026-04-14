@@ -48,7 +48,7 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
         borders["sovereign_geom"],
         occupied["occupied_geom"],
         borders["sovereign_border_metric"],
-        borders["frontline_boundary_metric"],
+        borders["unsafe_frontier_metric"],
         borders["exterior_boundary_metric"],
         clip_debug,
         config,
@@ -113,6 +113,8 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
             "count": len(coarse_demand_nodes),
             "unique_coarse_nodes": int(coarse_demand_nodes["coarse_node"].nunique()),
             "medoid_indices": [int(idx) for idx in demand_medoid_indices],
+            "daily_demand_total": float(coarse_demand_nodes["daily_demand"].sum()),
+            "daily_demand_range": _finite_list_range(coarse_demand_nodes["daily_demand"].to_list()),
         },
         "costs": {
             "a_i": _cost_range(cost_details["node_params"], "a_i"),

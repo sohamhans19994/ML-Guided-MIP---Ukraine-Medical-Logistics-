@@ -77,7 +77,7 @@ def cluster_demand_kmedoids(coords, n_clusters, random_state=42, max_iter=8, can
     return labels, medoid_indices
 
 
-def build_demand_nodes_kmedoids(df, n_clusters, random_state=42, candidate_cap=200):
+def build_demand_nodes_kmedoids(df, n_clusters, averaging_days=730, random_state=42, candidate_cap=200):
     working = df.copy()
     coords = working[["latitude", "longitude"]].to_numpy(dtype=float)
     labels, medoid_indices = cluster_demand_kmedoids(
@@ -104,9 +104,16 @@ def build_demand_nodes_kmedoids(df, n_clusters, random_state=42, candidate_cap=2
         )
         .reset_index()
     )
+    averaging_days = float(averaging_days)
+    if averaging_days <= 0:
+        raise ValueError("averaging_days must be positive")
+    demand_raw["daily_demand"] = demand_raw["n_events"] / averaging_days
+    demand_raw["daily_fatalities"] = demand_raw["total_fatalities"] / averaging_days
     demand_raw["lat"] = demand_raw["cluster"].map(lambda c: medoid_lookup[c]["lat"])
     demand_raw["lon"] = demand_raw["cluster"].map(lambda c: medoid_lookup[c]["lon"])
-    demand_raw = demand_raw[["lat", "lon", "n_events", "total_fatalities"]].reset_index(drop=True)
+    demand_raw = demand_raw[
+        ["lat", "lon", "n_events", "daily_demand", "total_fatalities", "daily_fatalities"]
+    ].reset_index(drop=True)
     return working, demand_raw, medoid_indices
 
 
@@ -126,6 +133,7 @@ def load_demand_nodes(config: dict):
     filtered_df, demand_nodes, medoid_indices = build_demand_nodes_kmedoids(
         acled_df,
         n_clusters=int(demand_cfg["n_clusters"]),
+        averaging_days=float(demand_cfg.get("averaging_days", 730)),
         random_state=int(demand_cfg["random_state"]),
         candidate_cap=int(demand_cfg["candidate_cap"]),
     )

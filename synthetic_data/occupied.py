@@ -10,6 +10,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from shapely.ops import unary_union
 
 from .utils import migrate_if_missing
 
@@ -124,13 +125,29 @@ def load_ukraine_sovereign_geometry(config: dict, occupied_geom):
     if ukraine_shape.empty:
         raise ValueError("Could not find Ukraine in the Natural Earth country polygon layer")
 
+    russia_labels = {"Russia", "Russian Federation"}
+    russia_shape = ne_countries[
+        ne_countries.get("ADMIN", pd.Series(index=ne_countries.index, dtype=object)).isin(russia_labels)
+        | ne_countries.get("SOVEREIGNT", pd.Series(index=ne_countries.index, dtype=object)).isin(russia_labels)
+        | ne_countries.get("NAME", pd.Series(index=ne_countries.index, dtype=object)).isin(russia_labels)
+        | ne_countries.get("NAME_LONG", pd.Series(index=ne_countries.index, dtype=object)).isin(russia_labels)
+    ].copy()
+    if russia_shape.empty:
+        raise ValueError("Could not find Russia in the Natural Earth country polygon layer")
+
     ukraine_geom = (
         ukraine_shape.geometry.union_all()
         if hasattr(ukraine_shape.geometry, "union_all")
         else ukraine_shape.geometry.unary_union
     )
+    russia_geom = (
+        russia_shape.geometry.union_all()
+        if hasattr(russia_shape.geometry, "union_all")
+        else russia_shape.geometry.unary_union
+    )
     occupied_metric = gpd.GeoSeries([occupied_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
     ukraine_metric = gpd.GeoSeries([ukraine_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
+    russia_metric = gpd.GeoSeries([russia_geom], crs="EPSG:4326").to_crs(3857).iloc[0]
 
     sovereign_metric = ukraine_metric.difference(occupied_metric)
     if sovereign_metric.is_empty:
@@ -147,6 +164,21 @@ def load_ukraine_sovereign_geometry(config: dict, occupied_geom):
     if frontline_boundary_metric.is_empty:
         frontline_boundary_metric = occupied_metric.boundary
 
+    border_match_m = frontline_match_km * 1000.0
+    ukraine_russia_border_metric = ukraine_metric.boundary.intersection(
+        russia_metric.boundary.buffer(border_match_m)
+    )
+    if ukraine_russia_border_metric.is_empty:
+        ukraine_russia_border_metric = ukraine_metric.boundary.intersection(
+            russia_metric.buffer(border_match_m)
+        )
+
+    unsafe_frontier_metric = unary_union(
+        [geom for geom in [frontline_boundary_metric, ukraine_russia_border_metric] if not geom.is_empty]
+    )
+    if unsafe_frontier_metric.is_empty:
+        unsafe_frontier_metric = frontline_boundary_metric
+
     exterior_boundary_metric = sovereign_border_metric.difference(
         occupied_metric.buffer(frontline_match_km * 1000.0)
     )
@@ -162,6 +194,10 @@ def load_ukraine_sovereign_geometry(config: dict, occupied_geom):
         "sovereign_border_gs": gpd.GeoSeries([sovereign_border_metric], crs=3857).to_crs("EPSG:4326"),
         "frontline_boundary_metric": frontline_boundary_metric,
         "frontline_boundary_gs": gpd.GeoSeries([frontline_boundary_metric], crs=3857).to_crs("EPSG:4326"),
+        "ukraine_russia_border_metric": ukraine_russia_border_metric,
+        "ukraine_russia_border_gs": gpd.GeoSeries([ukraine_russia_border_metric], crs=3857).to_crs("EPSG:4326"),
+        "unsafe_frontier_metric": unsafe_frontier_metric,
+        "unsafe_frontier_gs": gpd.GeoSeries([unsafe_frontier_metric], crs=3857).to_crs("EPSG:4326"),
         "exterior_boundary_metric": exterior_boundary_metric,
     }
 
@@ -206,7 +242,7 @@ def annotate_graph_with_border_metrics(
     sovereign_geom,
     occupied_geom,
     sovereign_border_metric,
-    frontline_boundary_metric,
+    unsafe_frontier_metric,
     exterior_boundary_metric,
     clip_debug: dict,
     config: dict,
@@ -230,7 +266,7 @@ def annotate_graph_with_border_metrics(
         for n in node_ids
     }
     territory_frontline_distance_km = {
-        n: float(node_points_metric.loc[n].distance(frontline_boundary_metric) / 1000.0)
+        n: float(node_points_metric.loc[n].distance(unsafe_frontier_metric) / 1000.0)
         for n in node_ids
     }
     territory_rear_distance_km = {
