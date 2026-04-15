@@ -12,6 +12,7 @@ uv.lock
 .claude
 
 data/
+cache/
 
 # Tool caches (auto-regenerated, not project data)
 .cache/
