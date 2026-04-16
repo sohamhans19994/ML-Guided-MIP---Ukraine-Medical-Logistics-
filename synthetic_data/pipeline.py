@@ -194,6 +194,15 @@ def build_synthetic_dataset(config_path: str | Path | None = None, generate_visu
 def load_saved_synthetic_bundle(bundle_path: str | Path | None = None):
     config = load_config()
     path = Path(bundle_path or config["paths"]["bundle_pickle"])
+    if not path.exists():
+        print(
+            f"[synthetic_data] Bundle not found at {path}.\n"
+            "Generating synthetic dataset (downloads road network from OSM — "
+            "requires internet access, takes ~2 min on first run)..."
+        )
+        bundle = build_synthetic_dataset()
+        print(f"[synthetic_data] Bundle generated and saved to {path}.")
+        return bundle
     return read_pickle(path)
 
 

@@ -338,7 +338,9 @@ def generate_training_data(
     base_seed   : rng seed; trial i uses base_seed + i * n_scenarios
     n_workers   : parallel worker processes (default: 1 = sequential).
                   Each worker gets floor(cpu_count / n_workers) Gurobi threads.
-                  Recommended: 2–4 on a machine with 8–16 cores.
+                  Gurobi B&B parallelism saturates around 4-8 threads, so prefer
+                  more workers with fewer threads: e.g. n_workers=8 on 32 cores
+                  (4 threads/worker). Cap around 16 due to RAM (~1-2 GB/worker).
     verbose     : print progress
 
     Returns
@@ -491,7 +493,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-workers", type=int, default=1,
                    help="Parallel worker processes (default: 1 = sequential). "
-                        "Recommended: 2-4 on 8-16 core machines.")
+                        "Each worker gets floor(cpu_count/n_workers) Gurobi threads. "
+                        "Gurobi B&B parallelism saturates around 4-8 threads, so use "
+                        "more workers with fewer threads each: e.g. --n-workers 8 on a "
+                        "32-core machine (4 threads/worker). Cap at ~16 due to RAM "
+                        "(each worker loads the full instance + Gurobi model ~1-2 GB).")
     p.add_argument("--quiet", action="store_true")
     return p
 

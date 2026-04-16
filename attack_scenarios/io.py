@@ -19,9 +19,8 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def load_base_bundle(bundle_path: str | Path):
-    path = Path(bundle_path)
-    with path.open("rb") as handle:
-        return pickle.load(handle)
+    from synthetic_data.pipeline import load_saved_synthetic_bundle
+    return load_saved_synthetic_bundle(bundle_path)
 
 
 def sanitize_graph_for_graphml(graph: nx.Graph) -> nx.Graph:
