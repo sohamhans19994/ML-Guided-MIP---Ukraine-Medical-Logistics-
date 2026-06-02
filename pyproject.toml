@@ -24,4 +24,6 @@ dependencies = [
     "pyyaml>=6.0.2",
     "scikit-learn>=1.8.0",
     "shapely>=2.1.2",
+    "torch>=2.0.0",
+    "torch-geometric>=2.4.0",
 ]
