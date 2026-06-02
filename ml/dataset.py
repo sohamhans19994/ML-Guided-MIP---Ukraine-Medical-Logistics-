@@ -55,6 +55,7 @@ import torch
 from torch_geometric.data import HeteroData
 
 from mip.data import MIPInstance
+from mip.scenarios import ScenarioData
 from ml.training import TrainingRecord, PoolSolution
 
 
@@ -91,6 +92,120 @@ N_EDGES_BASE = 148    # edges in the base coarse graph (from Table 1 in report)
 
 
 # ---------------------------------------------------------------------------
+# Standalone graph-building utilities (used by both dataset and predict_search)
+# ---------------------------------------------------------------------------
+
+def build_hub_features(instance: MIPInstance) -> tuple[torch.Tensor, list[int], dict[int, int]]:
+    """
+    Build static hub node features from the MIP instance.
+
+    Returns
+    -------
+    hub_feats : FloatTensor [n_hubs, 6]
+    hubs      : sorted list of hub node ids
+    hub_idx   : dict mapping hub node id -> index in hubs
+    """
+    CG   = instance.CG
+    hubs = sorted(instance.N)
+
+    def _minmax(x: np.ndarray) -> np.ndarray:
+        lo, hi = x.min(), x.max()
+        return (x - lo) / (hi - lo + 1e-8)
+
+    a_vals   = np.array([CG.nodes[h]["a_i"]                               for h in hubs], dtype=np.float32)
+    b_vals   = np.array([CG.nodes[h]["b_i"]                               for h in hubs], dtype=np.float32)
+    fl_cost  = np.array([CG.nodes[h].get("frontline_cost_component", 0.5) for h in hubs], dtype=np.float32)
+    mem_cost = np.array([CG.nodes[h].get("member_cost_component",    0.5) for h in hubs], dtype=np.float32)
+    edg_cost = np.array([CG.nodes[h].get("edge_support_cost_component", 0.5) for h in hubs], dtype=np.float32)
+    degree   = np.array([float(CG.degree(h))                              for h in hubs], dtype=np.float32)
+
+    feats = np.stack([
+        _minmax(a_vals),
+        _minmax(b_vals),
+        fl_cost,
+        mem_cost,
+        edg_cost,
+        _minmax(degree),
+    ], axis=1)   # [n_hubs, 6]
+
+    hub_idx = {h: i for i, h in enumerate(hubs)}
+    return torch.from_numpy(feats), hubs, hub_idx
+
+
+def build_instance_graph(
+    instance:  MIPInstance,
+    scenarios: list[ScenarioData],
+    hub_feats: torch.Tensor,
+    hubs:      list[int],
+    hub_idx:   dict[int, int],
+) -> HeteroData:
+    """
+    Build a HeteroData graph for one (instance, scenario-set) pair.
+
+    Used at inference time by predict_search.py — no TrainingRecord needed.
+    Labels (y, pool_y, pool_objs) are NOT attached; the graph is input-only.
+    """
+    D   = instance.D
+    n_d = len(D)
+    n_hubs = len(hubs)
+
+    # ---- scenario node features --------------------------------------
+    scen_rows = []
+    for s in scenarios:
+        ei           = s.summary.get("edge_impacts", {})
+        n_removed_e  = float(ei.get("removed_edges",  0))
+        n_degraded_e = float(ei.get("degraded_edges", 0))
+        scen_rows.append([
+            s.K / MAX_K,
+            s.T / MAX_T,
+            len(s.surviving_nodes) / max(n_hubs, 1),
+            n_removed_e  / max(N_EDGES_BASE, 1),
+            n_degraded_e / max(N_EDGES_BASE, 1),
+        ])
+    scen_x = torch.tensor(scen_rows, dtype=torch.float)   # [n_s, 5]
+
+    # ---- edges: hub ↔ scenario ---------------------------------------
+    hub_idxs, scen_idxs, edge_rows = [], [], []
+
+    for s_idx, s in enumerate(scenarios):
+        surviving_set = set(s.surviving_nodes)
+        for j in hubs:
+            if j not in surviving_set:
+                continue
+
+            costs = [s.c[(i, j)] for i in D if (i, j) in s.c]
+            if not costs:
+                continue
+
+            hub_idxs.append(hub_idx[j])
+            scen_idxs.append(s_idx)
+            edge_rows.append([
+                float(np.mean(costs)) / MAX_COST_HR,
+                float(np.min(costs))  / MAX_COST_HR,
+                float(np.max(costs))  / MAX_COST_HR,
+                len(costs) / n_d,
+            ])
+
+    if edge_rows:
+        ei_hs = torch.tensor([hub_idxs, scen_idxs], dtype=torch.long)
+        ea_hs = torch.tensor(edge_rows, dtype=torch.float)
+        ei_sh = ei_hs.flip(0)
+    else:
+        ei_hs = torch.zeros((2, 0), dtype=torch.long)
+        ea_hs = torch.zeros((0, 4), dtype=torch.float)
+        ei_sh = ei_hs.clone()
+
+    data = HeteroData()
+    data["hub"].x      = hub_feats
+    data["scenario"].x = scen_x
+    data["hub",      "survives_in",  "scenario"].edge_index = ei_hs
+    data["hub",      "survives_in",  "scenario"].edge_attr  = ea_hs
+    data["scenario", "rev_survives", "hub"      ].edge_index = ei_sh
+    data["scenario", "rev_survives", "hub"      ].edge_attr  = ea_hs
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Dataset class
 # ---------------------------------------------------------------------------
 
@@ -110,141 +225,28 @@ class HubLocationDataset:
         instance: MIPInstance,
     ) -> None:
         self.instance = instance
-        self.hubs     = sorted(instance.N)          # canonical hub ordering
-        self.n_hubs   = len(self.hubs)
-        self.hub_idx  = {h: i for i, h in enumerate(self.hubs)}
-
-        # hub features are the same for every record — build once
-        self._hub_feats = self._build_hub_features()  # [n_hubs, 6]
-
-        # build all graphs upfront
+        self._hub_feats, self.hubs, self.hub_idx = build_hub_features(instance)
+        self.n_hubs = len(self.hubs)
         self.graphs = [self._build_graph(r) for r in records]
 
-    # ------------------------------------------------------------------
-    # static hub features (identical across all records)
-    # ------------------------------------------------------------------
-
-    def _build_hub_features(self) -> torch.Tensor:
-        CG = self.instance.CG
-
-        a_vals   = np.array([CG.nodes[h]["a_i"]                              for h in self.hubs], dtype=np.float32)
-        b_vals   = np.array([CG.nodes[h]["b_i"]                              for h in self.hubs], dtype=np.float32)
-        fl_cost  = np.array([CG.nodes[h].get("frontline_cost_component", 0.5)   for h in self.hubs], dtype=np.float32)
-        mem_cost = np.array([CG.nodes[h].get("member_cost_component",     0.5)  for h in self.hubs], dtype=np.float32)
-        edg_cost = np.array([CG.nodes[h].get("edge_support_cost_component", 0.5) for h in self.hubs], dtype=np.float32)
-        degree   = np.array([float(CG.degree(h))                              for h in self.hubs], dtype=np.float32)
-
-        def _minmax(x: np.ndarray) -> np.ndarray:
-            lo, hi = x.min(), x.max()
-            return (x - lo) / (hi - lo + 1e-8)
-
-        feats = np.stack([
-            _minmax(a_vals),   # opening cost (normalised)
-            _minmax(b_vals),   # capacity cost (normalised)
-            fl_cost,           # frontline danger (already 0-1)
-            mem_cost,          # cluster-size cost component (already 0-1)
-            edg_cost,          # edge-support cost component (already 0-1)
-            _minmax(degree),   # road connectivity (normalised)
-        ], axis=1)             # [n_hubs, 6]
-
-        return torch.from_numpy(feats)
-
-    # ------------------------------------------------------------------
-    # per-record graph construction
-    # ------------------------------------------------------------------
-
     def _build_graph(self, record: TrainingRecord) -> HeteroData:
-        scenarios = record.scenarios
-        n_s       = len(scenarios)
-        D         = self.instance.D
-        n_d       = len(D)
+        """Build graph + labels for one training record."""
+        data = build_instance_graph(
+            self.instance, record.scenarios,
+            self._hub_feats, self.hubs, self.hub_idx,
+        )
 
-        # ---- scenario node features ----------------------------------
-        scen_rows = []
-        for s in scenarios:
-            ei           = s.summary.get("edge_impacts", {})
-            n_removed_e  = float(ei.get("removed_edges",  0))
-            n_degraded_e = float(ei.get("degraded_edges", 0))
-            scen_rows.append([
-                s.K / MAX_K,
-                s.T / MAX_T,
-                len(s.surviving_nodes) / max(self.n_hubs, 1),
-                n_removed_e  / max(N_EDGES_BASE, 1),
-                n_degraded_e / max(N_EDGES_BASE, 1),
-            ])
-        scen_x = torch.tensor(scen_rows, dtype=torch.float)   # [n_s, 5]
-
-        # ---- edges: hub ↔ scenario -----------------------------------
-        hub_idxs, scen_idxs, edge_rows = [], [], []
-
-        for s_idx, s in enumerate(scenarios):
-            surviving_set = set(s.surviving_nodes)
-            for j in self.hubs:
-                if j not in surviving_set:
-                    continue   # hub destroyed in this scenario — no edge
-
-                costs = [s.c[(i, j)] for i in D if (i, j) in s.c]
-                if not costs:
-                    continue   # hub unreachable from every demand node
-
-                mean_c     = float(np.mean(costs)) / MAX_COST_HR
-                min_c      = float(np.min(costs))  / MAX_COST_HR
-                max_c      = float(np.max(costs))  / MAX_COST_HR
-                frac_reach = len(costs) / n_d
-
-                hub_idxs.append(self.hub_idx[j])
-                scen_idxs.append(s_idx)
-                edge_rows.append([mean_c, min_c, max_c, frac_reach])
-
-        if edge_rows:
-            ei_hs   = torch.tensor([hub_idxs, scen_idxs], dtype=torch.long)
-            ea_hs   = torch.tensor(edge_rows, dtype=torch.float)
-            ei_sh   = ei_hs.flip(0)   # reversed for scenario→hub direction
-        else:
-            ei_hs = torch.zeros((2, 0), dtype=torch.long)
-            ea_hs = torch.zeros((0, 4), dtype=torch.float)
-            ei_sh = ei_hs.clone()
-
-        # ---- labels --------------------------------------------------
-        opt   = record.pool_solutions[0]
-
-        # hard binary labels for BCE — rounded optimal assignment
-        y_bin = torch.tensor(
-            [float(opt.y_open.get(h, 0)) for h in self.hubs],
-            dtype=torch.float,
-        )   # [n_hubs]
-
-        # soft labels from all pool solutions for InfoNCE
-        # y_raw are the raw Gurobi Xn values (continuous, not rounded)
-        pool_y = torch.tensor(
+        opt = record.pool_solutions[0]
+        data["hub"].y = torch.tensor(
+            [float(opt.y_open.get(h, 0)) for h in self.hubs], dtype=torch.float,
+        )
+        data["hub"].pool_y = torch.tensor(
             [[float(sol.y_raw.get(h, 0.0)) for h in self.hubs]
-             for sol in record.pool_solutions],
-            dtype=torch.float,
-        )   # [n_pool, n_hubs]
-
-        pool_objs = torch.tensor(
-            [sol.obj_val for sol in record.pool_solutions],
-            dtype=torch.float,
-        )   # [n_pool]
-
-        # ---- assemble ------------------------------------------------
-        data = HeteroData()
-
-        data["hub"].x         = self._hub_feats   # [n_hubs, 6]
-        data["hub"].y         = y_bin             # [n_hubs]        BCE label
-        data["hub"].pool_y    = pool_y            # [n_pool, n_hubs]
-        data["hub"].pool_objs = pool_objs         # [n_pool]
-
-        data["scenario"].x = scen_x              # [n_s, 5]
-
-        # hub → scenario (hub survived in scenario)
-        data["hub", "survives_in",  "scenario"].edge_index = ei_hs
-        data["hub", "survives_in",  "scenario"].edge_attr  = ea_hs
-
-        # scenario → hub (reverse for message passing)
-        data["scenario", "rev_survives", "hub"].edge_index = ei_sh
-        data["scenario", "rev_survives", "hub"].edge_attr  = ea_hs
-
+             for sol in record.pool_solutions], dtype=torch.float,
+        )
+        data["hub"].pool_objs = torch.tensor(
+            [sol.obj_val for sol in record.pool_solutions], dtype=torch.float,
+        )
         return data
 
     # ------------------------------------------------------------------
