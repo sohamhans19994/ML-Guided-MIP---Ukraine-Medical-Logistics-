@@ -35,8 +35,9 @@ from mip.data import load_instance
 from ml.dataset import load_splits
 from ml.model import HubGNN
 
-N_HUBS = 112   # fixed for this instance
-N_POOL = 10    # pool solutions per training record
+# These are derived from the data at runtime — see batch_loss()
+# N_HUBS = number of hub candidates (112 for this instance)
+# N_POOL = pool solutions per record (10 by default in ml/training.py)
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +89,15 @@ def batch_loss(
     if loss_name == "bce":
         return bce_loss(probs, batch["hub"].y)
 
-    # InfoNCE: compute per-graph, average
-    # PyG concatenates pool_y along dim 0: batch["hub"].pool_y is [B*N_POOL, N_HUBS]
-    probs_list  = probs.split(N_HUBS)
-    pool_y_all  = batch["hub"].pool_y           # [B*N_POOL, N_HUBS]
-    pool_y_list = pool_y_all.split(N_POOL)      # list of [N_POOL, N_HUBS]
+    # InfoNCE: compute per-graph, average.
+    # Derive dimensions from the batch itself — works for any |S| or pool size.
+    n_hubs = probs.size(0) // n_graphs                      # hubs per graph
+    n_pool = batch["hub"].pool_y.size(0) // n_graphs        # pool size per graph
+
+    # PyG concatenates pool_y along dim 0: [B*n_pool, n_hubs]
+    probs_list  = probs.split(n_hubs)
+    pool_y_all  = batch["hub"].pool_y
+    pool_y_list = pool_y_all.split(n_pool)      # list of [n_pool, n_hubs]
 
     total = torch.zeros(1, device=probs.device)
     for p, py in zip(probs_list, pool_y_list):
