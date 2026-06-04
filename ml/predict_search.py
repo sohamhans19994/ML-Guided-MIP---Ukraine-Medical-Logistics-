@@ -78,7 +78,10 @@ def _make_callback(model: gp.Model, snap_times: list[float]):
     records: list[tuple[float, float]] = []
     idx = [0]
 
-    def cb(where: int) -> None:
+    def cb(*args) -> None:
+        # gurobipy calls callback as cb(where) in newer versions and
+        # cb(model, where) in older versions — extract where from last arg
+        where = args[-1]
         if where != GRB.Callback.MIP:
             return
         if idx[0] >= len(snap_times):
