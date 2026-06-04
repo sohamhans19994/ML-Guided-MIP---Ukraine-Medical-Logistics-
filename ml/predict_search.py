@@ -173,20 +173,25 @@ def _apply_fixing_open_only(
     alpha:    float,
     model:    gp.Model,
 ) -> int:
-    """Fix top-alpha% hubs by confidence, but ONLY those predicted open (prob>=0.5).
-    Predicted-closed hubs are always left free regardless of confidence."""
-    n_fix       = max(1, int(round(alpha * len(hubs))))
-    confidence  = np.abs(probs_np - 0.5) * 2.0
-    fix_indices = np.argsort(confidence)[::-1][:n_fix]
+    """Fix the top-alpha% of predicted-open hubs (prob>=0.5) ranked by confidence.
+    Predicted-closed hubs are always left free — eliminates infeasibility risk.
 
-    n_actually_fixed = 0
-    for idx in fix_indices:
-        if probs_np[idx] >= 0.5:   # only fix OPEN predictions
-            model.addConstr(y_vars[hubs[idx]] == 1, name=f"fix_open_{hubs[idx]}")
-            n_actually_fixed += 1
+    Alpha applies only within the open-prediction pool, not across all hubs.
+    E.g. if 8 hubs are predicted open and alpha=0.50, fix the 4 most confident."""
+    open_indices = np.where(probs_np >= 0.5)[0]
+    if len(open_indices) == 0:
+        return 0
+
+    # rank predicted-open hubs by confidence (distance from 0.5)
+    open_confidence = np.abs(probs_np[open_indices] - 0.5) * 2.0
+    n_fix           = max(1, int(round(alpha * len(open_indices))))
+    top_open        = open_indices[np.argsort(open_confidence)[::-1][:n_fix]]
+
+    for idx in top_open:
+        model.addConstr(y_vars[hubs[idx]] == 1, name=f"fix_open_{hubs[idx]}")
 
     model.update()
-    return n_actually_fixed
+    return len(top_open)
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +356,11 @@ def solve_lns(
 
     # Record primal snapshots relative to t_start for the best obj found
     elapsed_total = time.perf_counter() - t_start
-    final_gap = float("nan")
-    if obj_current < float("inf"):
-        # gap is unknown unless last solve was optimal — report as nan
-        final_gap = 0.0 if iters_improved > 0 and elapsed_total < total_time_limit else float("nan")
-
     return SolveResult(
         label="LNS",
         time_s=elapsed_total,
         obj=obj_current,
-        gap=final_gap,
+        gap=float("nan"),   # true gap vs optimal is unknown; use obj comparison in summary
         nodes=total_nodes,
         feasible=True,
         lns_iters_done=iters_done,
@@ -406,7 +406,14 @@ def _snapshot_str(r: SolveResult, snap_times: list[float]) -> str:
 
 
 def _print_result(r: SolveResult, baseline_time: float, snap_times: list[float]) -> None:
-    status   = "OPTIMAL" if r.feasible and r.gap == 0.0 else ("INFEASIBLE" if not r.feasible else "TIME_LIMIT")
+    if not r.feasible:
+        status = "INFEASIBLE"
+    elif np.isnan(r.gap):
+        status = "FEASIBLE"
+    elif r.gap == 0.0:
+        status = "OPTIMAL"
+    else:
+        status = "TIME_LIMIT"
     speedup  = baseline_time / r.time_s if (r.feasible and r.time_s > 0) else float("nan")
     gap_str  = f"{r.gap:.2%}" if not np.isnan(r.gap) else "nan"
     spd_str  = f"{speedup:.2f}x" if not np.isnan(speedup) else "nan"
