@@ -276,21 +276,37 @@ def solve_lns(
       infeasible, run a short Gurobi solve (up to 1/3 of total budget).
 
     Phase 2 — Improve:
-      For each iteration, destroy k_destroy hubs (prioritised by GNN
-      uncertainty — least confident hubs destroyed first), fix all others
-      at current solution values, re-solve within iter_time_limit.
-      Accept if objective improves.
+      Destroy k_destroy hubs (prioritised by GNN uncertainty — least
+      confident hubs destroyed first), fix all others at current solution
+      values, re-solve within iter_time_limit. Accept if objective improves.
+      Iterate until the total time budget is exhausted (n_iters is only a
+      safety cap, not the stopping rule).
     """
     probs_np  = probs.detach().cpu().numpy()
     t_start   = time.perf_counter()
 
-    # ---- Phase 1: get initial feasible solution ----
-    init_budget = min(total_time_limit // 3, 120)
+    # snapshot bookkeeping — best-so-far primal bound at each snap time,
+    # measured relative to t_start (the start of the whole LNS run)
+    best_snapshots: list[tuple[float, float]] = []
+    snap_idx = 0
 
-    # Try P+S with alpha repair for init
+    def _record_snaps(best_obj: float) -> None:
+        nonlocal snap_idx
+        now = time.perf_counter() - t_start
+        while snap_idx < len(snap_times) and now >= snap_times[snap_idx]:
+            best_snapshots.append((snap_times[snap_idx], best_obj))
+            snap_idx += 1
+
+    # ---- Phase 1: get initial feasible solution ----
+    # Up to a third of the budget for initialisation (no hard cap): at large
+    # |S| even a single P+S solve can take several hundred seconds.
+    init_budget = max(1, total_time_limit // 3)
+
+    # Try P+S with alpha repair for init (snap_times passed so the early
+    # anytime curve reflects the real initial-solve incumbents)
     init_r = solve_with_alpha_repair(
         instance, scenarios, probs, hubs, hub_idx,
-        init_alpha, delta, init_budget, [], repair_step,
+        init_alpha, delta, init_budget, snap_times, repair_step,
     )
 
     if not init_r.feasible:
@@ -309,23 +325,27 @@ def solve_lns(
     obj_current = init_r.obj
     total_nodes = init_r.nodes
 
+    # Seed the anytime curve with the initial solve's incumbents. The callback
+    # records snap_times as a contiguous in-order prefix, so adopt it directly.
+    if init_r.snapshots:
+        best_snapshots = list(init_r.snapshots)
+        snap_idx = len(best_snapshots)
+    _record_snaps(obj_current)
+
     # uncertainty: low value = model is uncertain about this hub
     uncertainty = np.abs(probs_np - 0.5)    # [n_hubs], 0=uncertain 0.5=certain
 
     iters_done  = 0
     iters_improved = 0
-    best_snapshots: list[tuple[float, float]] = []
 
-    # ---- Phase 2: destroy-repair iterations ----
-    for it in range(n_iters):
-        elapsed = time.perf_counter() - t_start
-        if elapsed >= total_time_limit:
-            break
-
+    # ---- Phase 2: destroy-repair until the time budget is exhausted ----
+    # n_iters is only a safety cap; the real stopping rule is the time budget.
+    while iters_done < n_iters:
+        elapsed   = time.perf_counter() - t_start
         remaining = total_time_limit - elapsed
-        it_limit  = min(iter_time_limit, int(remaining))
-        if it_limit <= 5:
+        if remaining <= 5:
             break
+        it_limit = min(iter_time_limit, int(remaining))
 
         # Destroy: sample k_destroy hubs weighted by inverse uncertainty
         # (least confident hubs get highest probability of being freed)
@@ -345,7 +365,7 @@ def solve_lns(
         model.update()
 
         r = _run_model(model, variables, hubs, [], it_limit,
-                       f"LNS_iter{it+1}", n_fixed=len(hubs)-len(destroy_set))
+                       f"LNS_iter{iters_done+1}", n_fixed=len(hubs)-len(destroy_set))
         total_nodes += r.nodes
         iters_done  += 1
 
@@ -354,7 +374,11 @@ def solve_lns(
             y_current    = dict(r.y_vals)
             iters_improved += 1
 
-    # Record primal snapshots relative to t_start for the best obj found
+        _record_snaps(obj_current)
+
+    # fill any remaining snapshots within the elapsed budget with the final obj
+    _record_snaps(obj_current)
+
     elapsed_total = time.perf_counter() - t_start
     return SolveResult(
         label="LNS",
@@ -365,6 +389,7 @@ def solve_lns(
         feasible=True,
         lns_iters_done=iters_done,
         lns_improved=iters_improved,
+        snapshots=best_snapshots,
         y_vals=y_current,
     )
 
@@ -665,7 +690,9 @@ if __name__ == "__main__":
     p.add_argument("--seed",           type=int,   default=TEST_BASE_SEED)
     p.add_argument("--snapshots",      type=float, nargs="*", default=[])
     p.add_argument("--repair-step",    type=float, default=0.10)
-    p.add_argument("--lns-iters",      type=int,   default=5)
+    p.add_argument("--lns-iters",      type=int,   default=10000,
+                   help="Safety cap on destroy-repair iterations; the real "
+                        "stopping rule is the time budget. Leave at default.")
     p.add_argument("--lns-destroy",    type=int,   default=20)
     p.add_argument("--lns-iter-time",  type=int,   default=120)
     args = p.parse_args()
