@@ -69,6 +69,7 @@ class SolveResult:
     lns_improved:   int   = 0     # LNS: iterations that improved the solution
     snapshots: list[tuple[float, float]] = field(default_factory=list)
     y_vals:    dict[int, int] | None     = field(default=None, repr=False)
+    u_vals:    dict[int, float] | None   = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +121,13 @@ def _run_model(
 
     feasible = model.SolCount > 0
     y = variables["y"]
+    u = variables["u"]
 
     y_vals = None
+    u_vals = None
     if feasible:
         y_vals = {h: int(round(float(y[h].X))) for h in hubs}
+        u_vals = {h: float(u[h].X) for h in hubs}
 
     return SolveResult(
         label=label,
@@ -136,6 +140,7 @@ def _run_model(
         alpha_used=alpha_used,
         snapshots=records,
         y_vals=y_vals,
+        u_vals=u_vals,
     )
 
 
